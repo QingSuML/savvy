@@ -1,0 +1,277 @@
+import os
+import glob
+import shutil
+import argparse
+import json
+import time
+import re
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from PIL import Image
+from tqdm import tqdm
+
+from savvy import Savvy
+from savvy.runner_utils import choose_frame_sampling, setup_models
+from utils import show_masks_fast
+from evaluation.oga_metrics import VOSEvaluator, HM3DVOSDataset
+
+def process_single_scene(args, scene_id, data_root, out_eval_dir, out_vis_dir,
+                         sam1_mask_generator, predictor, save_visualizations=True,
+                         buffer_size=30, sam_num_points_per_side=32, segmenter_stride=3,
+                         adapt_num_points=False):
+    video_dir = os.path.join(data_root, scene_id, "jpg")
+    gt_scene_dir = os.path.join(data_root, scene_id, "semantic")
+
+    if not os.path.exists(video_dir) or not os.path.exists(gt_scene_dir):
+        print(f"Skipping {scene_id}: Missing video or GT data.")
+        return False
+
+    num_gt_frames = len(glob.glob(os.path.join(gt_scene_dir, "*.npy")))
+    interval, cutoff = choose_frame_sampling(num_gt_frames)
+
+    print(f"\n--- Processing {scene_id} ---")
+    print(f"Frames: {num_gt_frames} -> Capped at {cutoff}, Interval: {interval}")
+
+    inference_state = predictor.init_state(
+        video_path=video_dir,
+        start_frame_idx=0,
+        end_frame_idx=cutoff,
+        sample_interval=interval,
+        offload_video_to_cpu=True,
+        offload_state_to_cpu=True
+    )
+
+    video_segmenter = Savvy(
+        predictor,
+        inference_state,
+        segmenter=sam1_mask_generator,
+        buffer_size=buffer_size,
+        iou_threshold=0.5,
+        survival_threshold=0.1,
+        margin=args.margin,
+        memory_strength=0.1,
+        sam_num_points_per_side=sam_num_points_per_side,
+        segmenter_stride=segmenter_stride,
+        adapt_num_points=adapt_num_points,
+    )
+
+    merged_results = video_segmenter.track(external_masks_per_frame=None, start_frame_idx=0)
+
+    os.makedirs(out_eval_dir, exist_ok=True)
+    if save_visualizations:
+        os.makedirs(out_vis_dir, exist_ok=True)
+
+    frame_names = sorted(
+        [f for f in os.listdir(video_dir) if f.lower().endswith((".jpg", ".jpeg"))],
+        key=lambda p: int(''.join(filter(str.isdigit, os.path.splitext(p)[0])))
+    )
+
+    for out_frame_idx, (frame_key, frame_masks) in enumerate(tqdm(merged_results.items(), desc=f"Saving {scene_id}")):
+        img_path = os.path.join(video_dir, frame_names[out_frame_idx * interval])
+        img = np.array(Image.open(img_path))
+        h, w = img.shape[:2]
+
+        sorted_masks = []
+        if frame_masks:
+            sorted_masks = sorted(
+                frame_masks.items(),
+                key=lambda kv: int(np.squeeze(kv[1]).sum()),
+                reverse=True,   # large first, small later
+            )
+
+        label_map = np.zeros((h, w), dtype=np.uint16)
+        for obj_id, mask in sorted_masks:
+            label_map[mask.reshape(h, w).astype(bool)] = int(obj_id) + 1
+
+        Image.fromarray(label_map).save(
+            os.path.join(out_eval_dir, f"{frame_key * interval:06d}.png")
+        )
+        
+        if save_visualizations:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            sorted_frame_masks = dict(sorted_masks)
+            show_masks_fast(sorted_frame_masks, ax, show_id=True, img=img, seed=13)
+            plt.savefig(
+                os.path.join(out_vis_dir, f"frame_{frame_key * interval:06d}.png"),
+                bbox_inches='tight', pad_inches=0, dpi=100
+            )
+            plt.close(fig)
+
+    with open(os.path.join(out_eval_dir, ".completed"), "w") as f:
+        f.write("done")
+    return True
+
+def get_most_recent_eval(root_dir):
+    default_file = os.path.join(root_dir, "oga_full_results.json")
+    
+    if os.path.exists(default_file):
+        print(f"Using default results: {default_file}")
+        return default_file
+    
+    search_pattern = os.path.join(root_dir, "oga_full_results_*")
+    matching_paths = glob.glob(search_pattern)
+    
+    if matching_paths:
+        latest_path = max(matching_paths)
+        print(f"Default not found. Using most recent timestamped path: {latest_path}")
+        return latest_path
+    
+    return default_file
+
+def has_timestamp(filename):
+    pattern = r"\d{8}_\d{6}"
+    
+    if re.search(pattern, filename):
+        return True
+    return False
+
+def main(args):
+    # Runtime setup.
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+
+    sam1_gen, predictor = setup_models(device, args.sam1_ckpt, args.sam2_ckpt, args.sam2_cfg)
+    
+    eval_root = os.path.join(args.eval_dir, "Savvy")
+    vis_root = os.path.join(args.vis_dir, "Savvy")
+    os.makedirs(eval_root, exist_ok=True)
+    os.makedirs(vis_root, exist_ok=True)
+
+    # Resume from an existing output JSON when available.
+    dataset = HM3DVOSDataset(gt_dir=args.data_root, pred_dir=eval_root)
+    evaluator = VOSEvaluator(dataset, max_pattern_size=3)
+    history_file = get_most_recent_eval(eval_root)
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+    if os.path.exists(history_file):
+        if has_timestamp(history_file):
+            timestamp =  re.search(r"(\d{8}_\d{6})", history_file).group(1)
+        try:
+            with open(history_file, 'r') as f:
+                evaluator.results_per_scene.update(json.load(f))
+            shutil.copy(history_file, history_file + ".bak")
+            print(f"[*] History merged: {len(evaluator.results_per_scene)} scenes recovered.")
+        except Exception as e: print(f"[!] Error loading history: {e}")
+    
+    # Match renamed output folders by the canonical scene suffix.
+    def get_disk_map(root):
+        if not os.path.exists(root): return {}
+        return {d[-12:]: d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))}
+
+    eval_disk_map = get_disk_map(eval_root)
+    vis_disk_map = get_disk_map(vis_root)
+
+    all_scenes = args.scene_names if args.scene_names else sorted(dataset.get_scene_ids())
+    if args.resume_from and args.resume_from in all_scenes:
+        all_scenes = all_scenes[all_scenes.index(args.resume_from):]
+
+    # Main scene loop.
+    for scene_id in all_scenes:
+        if scene_id in evaluator.results_per_scene:
+            print(f"[*] Skipping {scene_id} (found in JSON record).")
+            continue
+
+        actual_eval_folder = eval_disk_map.get(scene_id, scene_id)
+        actual_vis_folder = vis_disk_map.get(scene_id, scene_id)
+        scene_eval_dir = os.path.join(eval_root, actual_eval_folder)
+        scene_vis_dir = os.path.join(vis_root, actual_vis_folder)
+
+        if os.path.exists(os.path.join(scene_eval_dir, ".completed")):
+            print(f"[*] Skipping {scene_id} (folder complete). Syncing metrics...")
+            evaluator.evaluate(scene_names=scene_id)
+            evaluator.save_results(output_dir=eval_root, tag=timestamp)
+            continue
+
+        if os.path.exists(scene_eval_dir):
+            shutil.rmtree(scene_eval_dir, ignore_errors=True)
+            shutil.rmtree(scene_vis_dir, ignore_errors=True)
+    
+
+        if process_single_scene(
+            args, scene_id, args.data_root, scene_eval_dir, scene_vis_dir,
+            sam1_gen, predictor, save_visualizations=not args.no_vis,
+            buffer_size=args.buffer_size, sam_num_points_per_side=args.sam_points,
+            segmenter_stride=args.segmenter_stride,
+            adapt_num_points=args.adapt_num_points,
+        ):
+            evaluator.evaluate(scene_names=scene_id)
+            evaluator.save_results(output_dir=eval_root, tag=timestamp)
+
+    # Optionally keep only top/bottom scenes for qualitative inspection.
+    if evaluator.results_per_scene and not args.scene_names and args.k_keep > 0:
+        print(f"\n[*] Cleaning up and organizing Top/Bottom {args.k_keep} for both IP and VPQ_inf...")
+        
+        # Rank by combined identity persistence.
+        ranked_ip = sorted(
+            evaluator.results_per_scene.keys(),
+            key=lambda sid: evaluator.results_per_scene[sid].get('identity_persistence', {}).get('combined', 0),
+            reverse=True
+        )
+        top_ip = ranked_ip[:args.k_keep]
+        bot_ip = ranked_ip[-args.k_keep:]
+
+        # Rank by VPQ_inf.
+        ranked_vpq = sorted(
+            evaluator.results_per_scene.keys(),
+            key=lambda sid: evaluator.results_per_scene[sid].get('baselines', {}).get('VPQ_inf', 0),
+            reverse=True
+        )
+        top_vpq = ranked_vpq[:args.k_keep]
+        bot_vpq = ranked_vpq[-args.k_keep:]
+
+        # Combine into one keep set.
+        keep_set = set(top_ip + bot_ip + top_vpq + bot_vpq)
+        
+        for scene_id in list(evaluator.results_per_scene.keys()):
+            old_eval_path = os.path.join(eval_root, scene_id)
+            old_vis_path = os.path.join(vis_root, scene_id)
+
+            if scene_id not in keep_set:
+                shutil.rmtree(old_eval_path, ignore_errors=True)
+                shutil.rmtree(old_vis_path, ignore_errors=True)
+            else:
+                # Prefix kept folders with the ranking groups they belong to.
+                tags = []
+                if scene_id in top_ip:  tags.append(f"TopIP{top_ip.index(scene_id) + 1}")
+                if scene_id in bot_ip:  tags.append(f"BotIP{list(reversed(bot_ip)).index(scene_id) + 1}")
+                if scene_id in top_vpq: tags.append(f"TopVPQ{top_vpq.index(scene_id) + 1}")
+                if scene_id in bot_vpq: tags.append(f"BotVPQ{list(reversed(bot_vpq)).index(scene_id) + 1}")
+                
+                prefix = "_".join(tags) + "_"
+
+                new_eval_path = os.path.join(eval_root, f"{prefix}{scene_id}")
+                new_vis_path = os.path.join(vis_root, f"{prefix}{scene_id}")
+
+                if os.path.exists(old_eval_path):
+                    os.rename(old_eval_path, new_eval_path)
+                if os.path.exists(old_vis_path):
+                    os.rename(old_vis_path, new_vis_path)
+                
+                print(f"[*] Organized: {prefix}{scene_id}")
+
+    print(f"\n[*] Cleanup complete. PNGs kept for the best and worst performers across IP and VPQ.")
+    evaluator.print_summary()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", type=str, default="/path/to/hm3d")
+    parser.add_argument("--eval_dir", type=str, default="./eval_predictions")
+    parser.add_argument("--vis_dir", type=str, default="./eval_visualizations")
+    parser.add_argument("--sam1_ckpt", type=str, default="/path/to/sam_vit_h_4b8939.pth")
+    parser.add_argument("--sam2_ckpt", type=str, default="/path/to/sam2.1_hiera_large.pt")
+    parser.add_argument("--sam2_cfg", type=str, default="configs/sam2.1/sam2.1_hiera_l.yaml")
+    parser.add_argument("--buffer_size", type=int, default=30)
+    parser.add_argument("--sam_points", type=int, default=32)
+    parser.add_argument("--segmenter_stride", type=int, default=3)
+    parser.add_argument("--margin", type=float, default=0.1)
+    parser.add_argument("--gpu", type=str, default="1")
+    parser.add_argument("--scene_names", type=str, nargs='+', default=None)
+    parser.add_argument("--k_keep", type=int, default=10)
+    parser.add_argument("--no_vis", action="store_true")
+    parser.add_argument("--resume_from", type=str, default=None)
+    parser.add_argument("--adapt_num_points", action='store_true')
+
+    main(parser.parse_args())

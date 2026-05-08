@@ -1,0 +1,19 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local experiment outputs and checkpoints
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.mp4
+*.avi
+*.mov
+*.mkv
+eval_visualizations/
+oga_full_results*.json
+oga_full_results*.csv
+vipseg_savvy_oga_*
+savvy_vipseg_output*/
