@@ -1,4 +1,7 @@
+import csv
 import gc
+import os
+import time
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -48,6 +51,11 @@ class Savvy:
         segmenter_stride=3,
         adapt_num_points=False,
         exploratory=False,
+        behavior_log_path=None,
+        handshake_min_agreement_hits=5,
+        handshake_min_visible_frames_for_promotion=3,
+        handshake_min_max_area_for_promotion=-1,
+        handshake_min_max_area_ratio_for_promotion=-1.0,
     ):
         # SAM2 state.
         self.predictor = predictor
@@ -70,17 +78,27 @@ class Savvy:
         self.max_active_objects = max_active_objects
         self.min_area_to_keep = min_area_to_keep
 
-        self.handshake_min_agreement_hits = 5
-        self.handshake_min_visible_frames_for_promotion = 3
-        self.handshake_min_max_area_for_promotion = -1
-        self.handshake_min_max_area_ratio_for_promotion = -1.0
+        self.handshake_min_agreement_hits = handshake_min_agreement_hits
+        self.handshake_min_visible_frames_for_promotion = (
+            handshake_min_visible_frames_for_promotion
+        )
+        self.handshake_min_max_area_for_promotion = handshake_min_max_area_for_promotion
+        self.handshake_min_max_area_ratio_for_promotion = (
+            handshake_min_max_area_ratio_for_promotion
+        )
         self.exploratory=exploratory
+        self.behavior_log_path = behavior_log_path
+        self._behavior_log_file = None
+        self._behavior_log_writer = None
+        self._behavior_frame_count = 0
+        self._behavior_total_seconds = 0.0
+        self._behavior_frame_stats = {}
         self._image_hw = (
             inference_state["video_height"],
             inference_state["video_width"],
         )
         self._num_frames = inference_state["num_frames"]
-        
+
         # Initialize mutable tracking state.
         self.reset_state()
 
@@ -110,11 +128,119 @@ class Savvy:
 
         # SAM2 runtime settings.
         self.predictor.max_cond_frames_in_attn = 4
-        self._image_hw = (
-            inference_state["video_height"],
-            inference_state["video_width"],
+
+    def _open_behavior_log(self):
+        if self.behavior_log_path is None:
+            return
+
+        log_dir = os.path.dirname(self.behavior_log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        self._behavior_log_file = open(self.behavior_log_path, "w", newline="")
+        fieldnames = [
+            "frame_idx",
+            "frame_ordinal",
+            "frame_tracking_seconds",
+            "instant_tracking_fps",
+            "cumulative_tracking_fps",
+            "segmenter_invoked",
+            "segmenter_candidate_mask_count",
+            "newly_discovered_mask_count",
+            "object_set_size",
+            "active_object_count",
+            "established_object_count",
+            "transient_object_count",
+            "propagated_mask_count",
+            "total_mask_count",
+            "cuda_device_used_mb",
+            "cuda_memory_reserved_mb",
+            "cuda_memory_allocated_mb",
+        ]
+        self._behavior_log_writer = csv.DictWriter(
+            self._behavior_log_file, fieldnames=fieldnames
         )
-        self._num_frames = inference_state["num_frames"]
+        self._behavior_log_writer.writeheader()
+        self._behavior_frame_count = 0
+        self._behavior_total_seconds = 0.0
+
+    def _close_behavior_log(self):
+        if self._behavior_log_file is not None:
+            self._behavior_log_file.close()
+        self._behavior_log_file = None
+        self._behavior_log_writer = None
+
+    def _cuda_memory_stats_mb(self):
+        if not torch.cuda.is_available():
+            return 0.0, 0.0, 0.0
+
+        device = torch.cuda.current_device()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        used_mb = (total_bytes - free_bytes) / (1024 ** 2)
+        reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
+        allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
+        return used_mb, reserved_mb, allocated_mb
+
+    def _count_segmenter_candidates(self, external_masks):
+        if external_masks is None:
+            return 0
+        arr = np.asarray(external_masks)
+        if arr.ndim == 3:
+            return int(arr.shape[0])
+        labels = np.unique(arr)
+        return int(np.count_nonzero(labels))
+
+    def _start_behavior_frame(self):
+        self._behavior_frame_stats = {
+            "segmenter_invoked": 0,
+            "segmenter_candidate_mask_count": 0,
+            "newly_discovered_mask_count": 0,
+        }
+
+    def _write_behavior_frame(self, frame_idx, started_at, propagated_mask_count):
+        if self._behavior_log_writer is None:
+            return
+
+        elapsed = time.perf_counter() - started_at
+        self._behavior_frame_count += 1
+        self._behavior_total_seconds += elapsed
+
+        established_visible = len(self.all_results.get(frame_idx, {}))
+        transient_visible = sum(
+            1
+            for frame_masks in self.transient_mask_buffer.values()
+            if frame_idx in frame_masks and np.squeeze(frame_masks[frame_idx]).any()
+        )
+        active_object_count = len(self.inference_state.get("obj_id_to_idx", {}))
+        cuda_used, cuda_reserved, cuda_allocated = self._cuda_memory_stats_mb()
+
+        self._behavior_log_writer.writerow({
+            "frame_idx": frame_idx,
+            "frame_ordinal": self._behavior_frame_count - 1,
+            "frame_tracking_seconds": elapsed,
+            "instant_tracking_fps": 1.0 / elapsed if elapsed > 0 else 0.0,
+            "cumulative_tracking_fps": (
+                self._behavior_frame_count / self._behavior_total_seconds
+                if self._behavior_total_seconds > 0
+                else 0.0
+            ),
+            "segmenter_invoked": self._behavior_frame_stats["segmenter_invoked"],
+            "segmenter_candidate_mask_count": self._behavior_frame_stats[
+                "segmenter_candidate_mask_count"
+            ],
+            "newly_discovered_mask_count": self._behavior_frame_stats[
+                "newly_discovered_mask_count"
+            ],
+            "object_set_size": active_object_count,
+            "active_object_count": active_object_count,
+            "established_object_count": len(self.established_miss_streak),
+            "transient_object_count": len(self.buffer.transients),
+            "propagated_mask_count": propagated_mask_count,
+            "total_mask_count": established_visible + transient_visible,
+            "cuda_device_used_mb": cuda_used,
+            "cuda_memory_reserved_mb": cuda_reserved,
+            "cuda_memory_allocated_mb": cuda_allocated,
+        })
+        self._behavior_log_file.flush()
 
     def reset_state(self):
         """
@@ -320,74 +446,100 @@ class Savvy:
         """
         if reset:
             self.reset_state()
-        self._bootstrap(start_frame_idx, initial_next_obj_id, external_masks_per_frame)
+        self._open_behavior_log()
+        try:
+            self._bootstrap(start_frame_idx, initial_next_obj_id, external_masks_per_frame)
 
-        external_mask_keys = (
-            list(external_masks_per_frame.keys())
-            if external_masks_per_frame is not None
-            else None
-        )
-        
-        current_frame = start_frame_idx
+            external_mask_keys = (
+                list(external_masks_per_frame.keys())
+                if external_masks_per_frame is not None
+                else None
+            )
 
-        with tqdm(total=self._num_frames, desc="Savvy tracking") as pbar:
-            pbar.update(start_frame_idx)
+            current_frame = start_frame_idx
 
-            while current_frame < self._num_frames:
-                new_obj_found = False
+            with tqdm(total=self._num_frames, desc="Savvy tracking") as pbar:
+                pbar.update(start_frame_idx)
 
-                with _suppress_tqdm():
-                    for frame_idx, obj_ids, video_res_masks in self.predictor.propagate_in_video(
-                        self.inference_state,
-                        start_frame_idx=current_frame,
-                    ):
-                        backbone_out = self._get_backbone_out(frame_idx)
+                while current_frame < self._num_frames:
+                    new_obj_found = False
 
-                        self._store_results(
-                            frame_idx, obj_ids, video_res_masks, backbone_out
-                        )
-                        pbar.update(1)
+                    with _suppress_tqdm():
+                        for frame_idx, obj_ids, video_res_masks in self.predictor.propagate_in_video(
+                            self.inference_state,
+                            start_frame_idx=current_frame,
+                        ):
+                            frame_started_at = time.perf_counter()
+                            self._start_behavior_frame()
+                            propagated_mask_count = len(obj_ids)
+                            backbone_out = self._get_backbone_out(frame_idx)
 
-                        self._update_miss_streaks(frame_idx, backbone_out)
-                        self._apply_suppression(frame_idx, backbone_out)
+                            self._store_results(
+                                frame_idx, obj_ids, video_res_masks, backbone_out
+                            )
+                            pbar.update(1)
 
-                        # The bootstrap frame is already registered.
-                        if frame_idx == start_frame_idx and current_frame == start_frame_idx:
-                            continue
+                            self._update_miss_streaks(frame_idx, backbone_out)
+                            self._apply_suppression(frame_idx, backbone_out)
 
-                        # Merge transient tracks that agree with established tracks.
-                        if self._handle_merges(frame_idx, obj_ids):
-                            current_frame = frame_idx + 1
-                            new_obj_found = True
-                            break
+                            # The bootstrap frame is already registered.
+                            if frame_idx == start_frame_idx and current_frame == start_frame_idx:
+                                self._write_behavior_frame(
+                                    frame_idx, frame_started_at, propagated_mask_count
+                                )
+                                continue
 
-                        # Promote stable transients or discard expired ones.
-                        if self._handle_promotions(frame_idx):
-                            current_frame = frame_idx + 1
-                            new_obj_found = True
-                            break
-
-                        # Keep SAM2 memory bounded on long videos.
-                        self._prune_memory(frame_idx)
-                        if self._enforce_memory_limit(frame_idx):
-                            current_frame = frame_idx + 1
-                            new_obj_found = True
-                            break
-
-                        # Query for new objects at the segmenter stride.
-                        if frame_idx % self.segmenter_stride == 0:
-                            if self._handle_new_objects(
-                                frame_idx,
-                                video_res_masks,
-                                external_masks_per_frame,
-                                external_mask_keys,
-                            ):
+                            # Merge transient tracks that agree with established tracks.
+                            if self._handle_merges(frame_idx, obj_ids):
+                                self._write_behavior_frame(
+                                    frame_idx, frame_started_at, propagated_mask_count
+                                )
                                 current_frame = frame_idx + 1
                                 new_obj_found = True
                                 break
 
-                if not new_obj_found:
-                    break
+                            # Promote stable transients or discard expired ones.
+                            if self._handle_promotions(frame_idx):
+                                self._write_behavior_frame(
+                                    frame_idx, frame_started_at, propagated_mask_count
+                                )
+                                current_frame = frame_idx + 1
+                                new_obj_found = True
+                                break
+
+                            # Keep SAM2 memory bounded on long videos.
+                            self._prune_memory(frame_idx)
+                            if self._enforce_memory_limit(frame_idx):
+                                self._write_behavior_frame(
+                                    frame_idx, frame_started_at, propagated_mask_count
+                                )
+                                current_frame = frame_idx + 1
+                                new_obj_found = True
+                                break
+
+                            # Query for new objects at the segmenter stride.
+                            if frame_idx % self.segmenter_stride == 0:
+                                if self._handle_new_objects(
+                                    frame_idx,
+                                    video_res_masks,
+                                    external_masks_per_frame,
+                                    external_mask_keys,
+                                ):
+                                    self._write_behavior_frame(
+                                        frame_idx, frame_started_at, propagated_mask_count
+                                    )
+                                    current_frame = frame_idx + 1
+                                    new_obj_found = True
+                                    break
+
+                            self._write_behavior_frame(
+                                frame_idx, frame_started_at, propagated_mask_count
+                            )
+
+                    if not new_obj_found:
+                        break
+        finally:
+            self._close_behavior_log()
 
         self.all_results = backfill_transient_gaps(
             self.all_results, self.transient_mask_buffer
@@ -752,6 +904,11 @@ class Savvy:
     
         if external_masks is None:
             return False
+
+        self._behavior_frame_stats["segmenter_invoked"] = 1
+        self._behavior_frame_stats["segmenter_candidate_mask_count"] = (
+            self._count_segmenter_candidates(external_masks)
+        )
     
         extra_suppress = [
             m for t_id, t_frame_masks in self.transient_mask_buffer.items()
@@ -770,6 +927,8 @@ class Savvy:
     
         if not new_objects:
             return False
+
+        self._behavior_frame_stats["newly_discovered_mask_count"] = len(new_objects)
     
         for new_obj_id, surviving_mask in new_objects:
             self.predictor.add_new_mask(

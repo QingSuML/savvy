@@ -13,6 +13,11 @@ checkpoints/
 *.mov
 *.mkv
 eval_visualizations/
+eval_predictions/
+runtime_logs/
+savvy_behavior_logs/
+behavior_logs/
+visualizations/
 oga_full_results*.json
 oga_full_results*.csv
 vipseg_savvy_oga_*

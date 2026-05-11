@@ -23,6 +23,7 @@ Click any thumbnail to watch the demo on YouTube.
 - `evaluation/`: ScanNet, HM3D, and VIPSeg runners plus shared OGA metrics.
 - `visualization/`: cleaned source modules for support matrices, behavior
   matrices, sequence strips, and identity-event curves.
+- `tools/`: runtime and memory profiling utilities for ScanNet validation runs.
 - `notebooks/`: lightweight example notebooks that import the cleaned modules.
 - `sam2/` and `segment_anything/`: minimal adapted SAM2/SAM1 runtime subsets.
 - `run_*.sh`: root-level launch scripts for common inference and evaluation jobs.
@@ -63,6 +64,47 @@ For additional options:
 ```bash
 python -m inference.savvy_video_inference --help
 ```
+
+## Runtime Profiling
+
+We provide a lightweight profiling script for the submitted Savvy inference
+pipeline on the ScanNet validation split.
+
+The script runs the default full Savvy configuration, including hierarchical
+mask discovery, SAM2 propagation, deferred admission, track consolidation,
+memory pruning, and active-track control.
+
+Timing is reported as cumulative average FPS:
+
+```text
+processed frames / elapsed inference time
+```
+
+Visualization and metric computation are excluded from timing.
+
+Example command:
+
+```bash
+python tools/profile_savvy_runtime.py \
+    --device cuda:0 \
+    --output runtime_logs/scannet_val/ \
+    --gt_dir /path/to/scannet/gt \
+    --video_dir /path/to/scannet/scannet_val \
+    --sam1_ckpt /path/to/sam_vit_h_4b8939.pth \
+    --sam2_ckpt /path/to/sam2.1_hiera_large.pt
+```
+
+The generated plots summarize runtime behavior over all ScanNet validation
+scenes. Thin curves show individual scenes and the dark curve shows the mean.
+For readability, overlay traces are y-axis capped at the 95th percentile; the
+raw data and mean curve are unchanged.
+
+![Savvy runtime profile over ScanNet validation scenes](tools/runtime_profile_all.png)
+
+On an NVIDIA A6000, the final mean cumulative throughput is 7.4 FPS for the
+full Savvy pipeline. GPU memory remains bounded at roughly 6-7 GB while the
+object set grows over time, and the number of active masks per frame remains
+controlled throughout inference.
 
 ## Benchmark Evaluation
 
