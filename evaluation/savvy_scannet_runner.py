@@ -4,15 +4,18 @@ import shutil
 import argparse
 import json
 import numpy as np
-import torch
-import matplotlib.pyplot as plt
-from PIL import Image
-from tqdm import tqdm
 
-from savvy import Savvy
-from savvy.runner_utils import choose_frame_sampling, setup_models
-from utils import show_masks_fast
 from evaluation.oga_metrics import ScannetVOSDataset, VOSEvaluator
+
+def choose_frame_sampling(num_frames, max_frames=1500):
+    """Return the sample interval and frame cutoff used by the dataset runners."""
+    if num_frames <= 300:
+        return 1, num_frames
+    if num_frames <= 1000:
+        return 2, num_frames
+    if num_frames <= max_frames:
+        return 3, num_frames
+    return 3, max_frames
 
 def process_single_scene(args, scene_id, gt_base_dir, video_base_dir, out_eval_dir, out_vis_dir, 
                          sam1_mask_generator, predictor, save_visualizations=True,
@@ -20,6 +23,10 @@ def process_single_scene(args, scene_id, gt_base_dir, video_base_dir, out_eval_d
                          adapt_num_points=False,
                         ):
     """Runs the Savvy pipeline on a single scene and saves the raw masks."""
+    from PIL import Image
+    from tqdm import tqdm
+    from savvy import Savvy
+
     video_dir = os.path.join(video_base_dir, scene_id)
     gt_scene_dir = os.path.join(gt_base_dir, scene_id, "instance")
     
@@ -57,6 +64,9 @@ def process_single_scene(args, scene_id, gt_base_dir, video_base_dir, out_eval_d
     os.makedirs(out_eval_dir, exist_ok=True)
     
     if save_visualizations: 
+        import matplotlib.pyplot as plt
+        from utils import show_masks_fast
+
         os.makedirs(out_vis_dir, exist_ok=True)
 
     frame_names = sorted([f for f in os.listdir(video_dir) if f.endswith((".jpg", ".jpeg"))],
@@ -89,32 +99,10 @@ def process_single_scene(args, scene_id, gt_base_dir, video_base_dir, out_eval_d
     return True
 
 def main(args):
-    # Runtime setup.
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
-
-    sam1_gen, predictor = setup_models(device, args.sam1_ckpt, args.sam2_ckpt, args.sam2_cfg)
-    
     eval_root = os.path.join(args.eval_dir, "Savvy")
     vis_root = os.path.join(args.vis_dir, "Savvy")
     os.makedirs(eval_root, exist_ok=True)
     os.makedirs(vis_root, exist_ok=True)
-
-    # Resume from an existing output JSON when available.
-    dataset = ScannetVOSDataset(gt_dir=args.gt_dir, pred_dir=eval_root)
-    evaluator = VOSEvaluator(dataset, max_pattern_size=3)
-    filename = "oga_full_results.json" if args.exp_tag is None else f"oga_full_results_{args.exp_tag}.json"
-    history_file = os.path.join(eval_root, filename)
-
-    if os.path.exists(history_file):
-        try:
-            with open(history_file, 'r') as f:
-                evaluator.results_per_scene.update(json.load(f))
-            shutil.copy(history_file, history_file + ".bak")
-            print(f"[*] History merged: {len(evaluator.results_per_scene)} scenes recovered.")
-        except Exception as e: print(f"[!] Error loading history: {e}")
 
     # Match renamed output folders by the canonical ScanNet scene suffix.
     def get_disk_map(root):
@@ -124,9 +112,71 @@ def main(args):
     eval_disk_map = get_disk_map(eval_root)
     vis_disk_map = get_disk_map(vis_root)
 
+    # Resume from an existing output JSON when available.
+    dataset = ScannetVOSDataset(
+        gt_dir=args.gt_dir,
+        pred_dir=eval_root,
+        pred_scene_map=eval_disk_map,
+    )
+    evaluator = VOSEvaluator(dataset, max_pattern_size=3)
+    filename = "oga_full_results.json" if args.exp_tag is None else f"oga_full_results_{args.exp_tag}.json"
+    history_file = os.path.join(eval_root, filename)
+
+    if os.path.exists(history_file):
+        try:
+            with open(history_file, 'r') as f:
+                evaluator.results_per_scene.update(json.load(f))
+            print(f"[*] History merged: {len(evaluator.results_per_scene)} scenes recovered.")
+        except Exception as e: print(f"[!] Error loading history: {e}")
+
     all_scenes = args.scene_names if args.scene_names else sorted([s for s in dataset.get_scene_ids() if s.endswith("_00")])
     if args.resume_from and args.resume_from in all_scenes:
         all_scenes = all_scenes[all_scenes.index(args.resume_from):]
+
+    if args.eval_only:
+        for scene_id in all_scenes:
+            pred_scene_dir = eval_disk_map.get(scene_id, scene_id)
+            scene_eval_dir = os.path.join(eval_root, pred_scene_dir)
+            if not os.path.isdir(scene_eval_dir):
+                print(f"[*] Skipping {scene_id} (no prediction folder found).")
+                continue
+            print(f"[*] Evaluating existing predictions for {scene_id} from {pred_scene_dir}.")
+            if args.exp_tag is not None:
+                if args.exp_tag.split('_')[0] in ["clutter"]:
+                    evaluator.evaluate_clutter_test(scene_names=scene_id)
+                elif args.exp_tag.split('_')[0] in ["flicker"]:
+                    evaluator.evaluate_flickering_test(scene_names=scene_id)
+                elif args.exp_tag.split('_')[0] in ["dropout"]:
+                    evaluator.evaluate_drop_test(scene_names=scene_id)
+                elif args.exp_tag.split('_')[0] in ["sever"]:
+                    evaluator.evaluate_macro_sever_test(scene_names=scene_id)
+                elif args.exp_tag.split('_')[0] in ["void", "dilation"]:
+                    evaluator.evaluate_dilation_test(scene_names=scene_id)
+                else:
+                    evaluator.evaluate(scene_names=scene_id)
+            else:
+                evaluator.evaluate(scene_names=scene_id)
+            evaluator.save_results(output_dir=eval_root, tag=args.exp_tag)
+
+        evaluator.print_summary()
+        return
+
+    # Runtime setup.
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyTorch is required for ScanNet inference. Install torch or use "
+            "--eval_only to re-evaluate existing prediction PNGs."
+        ) from exc
+    from savvy.runner_utils import setup_models
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+
+    sam1_gen, predictor = setup_models(device, args.sam1_ckpt, args.sam2_ckpt, args.sam2_cfg)
 
     # Main scene loop.
     for scene_id in all_scenes:
@@ -247,6 +297,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_vis", action="store_true")
     parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--adapt_num_points", action='store_true')
+    parser.add_argument("--eval_only", action="store_true")
 
     parser.add_argument("--exp_tag", type=str, default=None)
         

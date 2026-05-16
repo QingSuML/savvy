@@ -7,6 +7,11 @@ SAM1_CKPT="${SAM1_CKPT:-/path/to/sam_vit_h_4b8939.pth}"
 SAM2_CKPT="${SAM2_CKPT:-/path/to/sam2.1_hiera_large.pt}"
 SAM2_CFG="${SAM2_CFG:-configs/sam2.1/sam2.1_hiera_l.yaml}"
 GPU_ID="${GPU_ID:-0}"
+EVAL_ONLY="${EVAL_ONLY:-0}"
+EXTRA_ARGS=()
+if [ "$EVAL_ONLY" = "1" ]; then
+        EXTRA_ARGS+=(--eval_only)
+fi
 
 echo "=========================================================="
 echo "Starting Savvy ScanNet evaluation"
@@ -25,4 +30,5 @@ python -m evaluation.savvy_scannet_runner \
         --segmenter_stride 3 \
         --k_keep 0 \
         --buffer_size 30 \
-        --margin 0.1
+        --margin 0.1 \
+        "${EXTRA_ARGS[@]}"

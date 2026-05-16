@@ -18,6 +18,9 @@ runtime_logs/
 savvy_behavior_logs/
 behavior_logs/
 visualizations/
+!assets/visualizations/
+!assets/visualizations/**
+assets/visualizations/.DS_Store
 oga_full_results*.json
 oga_full_results*.csv
 vipseg_savvy_oga_*

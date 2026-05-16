@@ -2,21 +2,24 @@ import glob
 import os
 
 import numpy as np
-from PIL import Image
 
 
 class ScannetVOSDataset:
-    def __init__(self, gt_dir, pred_dir):
+    def __init__(self, gt_dir, pred_dir, pred_scene_map=None):
         self.gt_dir = gt_dir
         self.pred_dir = pred_dir
+        self.pred_scene_map = pred_scene_map or {}
         
     def get_scene_ids(self):
         return sorted([d for d in os.listdir(self.gt_dir) 
                        if os.path.isdir(os.path.join(self.gt_dir, d))])
         
     def load_scene_frames(self, scene_id):
+        from PIL import Image
+
         gt_path = os.path.join(self.gt_dir, scene_id, "instance")
-        pr_path = os.path.join(self.pred_dir, scene_id)
+        pred_scene_dir = self.pred_scene_map.get(scene_id, scene_id)
+        pr_path = os.path.join(self.pred_dir, pred_scene_dir)
         
         if not all(os.path.exists(p) for p in [gt_path, pr_path]): 
             return [], []
@@ -62,21 +65,28 @@ class ScannetVOSDataset:
         return pl, gl
 
 class HM3DVOSDataset:
-    def __init__(self, gt_dir, pred_dir):
+    def __init__(self, gt_dir, pred_dir, pred_scene_map=None):
         self.gt_dir = gt_dir
         self.pred_dir = pred_dir
+        self.pred_scene_map = pred_scene_map or {}
 
     def get_scene_ids(self):
         return sorted([
             d for d in os.listdir(self.gt_dir)
             if os.path.isdir(os.path.join(self.gt_dir, d))
-            and os.path.isdir(os.path.join(self.gt_dir, d, "jpg"))
+            and (
+                os.path.isdir(os.path.join(self.gt_dir, d, "jpg"))
+                or os.path.isdir(os.path.join(self.gt_dir, d, "rgb"))
+            )
             and os.path.isdir(os.path.join(self.gt_dir, d, "semantic"))
         ])
 
     def load_scene_frames(self, scene_id):
+        from PIL import Image
+
         gt_path = os.path.join(self.gt_dir, scene_id, "semantic")
-        pr_path = os.path.join(self.pred_dir, scene_id)
+        pred_scene_dir = self.pred_scene_map.get(scene_id, scene_id)
+        pr_path = os.path.join(self.pred_dir, pred_scene_dir)
 
         if not all(os.path.exists(p) for p in [gt_path, pr_path]):
             return [], []

@@ -100,9 +100,6 @@ def _compute_identity_concentration(
     iou_thr=0.5,
     ios_thr=0.5,
     use_void_tolerant=True,
-    use_redundancy_factor=False,
-    strict_alpha=1.0,
-    weighted_ic_p=False,
 ):
     """
     Structural Identity Concentration (IC).
@@ -126,12 +123,7 @@ def _compute_identity_concentration(
       IC_G(g) = 1 / (# distinct predictions ever matched to g)
       IC_P(p) = 1 / (# distinct GTs ever matched to p)
 
-    Optional:
-      - weighted_ic_p=True:
-            apply mild precision weighting on prediction axis
-      - use_redundancy_factor=True:
-            multiply IC_G by frame-level union-efficiency over active matched preds
-            to additionally penalize concurrent overlapping duplicates
+    Unmatched ids contribute 0.
     """
     num_p = len(p_ids)
     num_g = len(g_ids)
@@ -139,15 +131,6 @@ def _compute_identity_concentration(
     # Track ever-matched relations over the whole sequence
     matched_preds_for_gt = {gid: set() for gid in g_ids}
     matched_gts_for_pred = {pid: set() for pid in p_ids}
-
-    # For optional redundancy factor
-    frame_p_masks = []
-    frame_p_areas = []
-    frame_g_masks = []
-
-    # For optional weighted IC_P
-    p_area_sums = np.zeros(num_p, dtype=np.float64)
-    g_area_sums = np.zeros(num_g, dtype=np.float64)
 
     for ps, gs in zip(seg_list, gt_list):
         p_arr = _to_numpy(ps).astype(np.int64)
@@ -171,15 +154,6 @@ def _compute_identity_concentration(
         else:
             p_masks = p_masks_raw
             p_areas = p_areas_raw
-
-        frame_p_masks.append(p_masks)
-        frame_p_areas.append(p_areas)
-        frame_g_masks.append(g_masks)
-
-        for pid, area in p_areas.items():
-            p_area_sums[p_map[pid]] += area
-        for gid, area in g_areas.items():
-            g_area_sums[g_map[gid]] += area
 
         # Frame-level matching, but relations are accumulated globally
         for pid, pmask in p_masks.items():
@@ -208,27 +182,9 @@ def _compute_identity_concentration(
     # Prediction-axis identity concentration.
     ic_p = np.zeros(num_p, dtype=np.float64)
 
-    if weighted_ic_p:
-        # Optional precision-weighted structural variant.
-        for pid, idx_p in p_map.items():
-            matched_gids = matched_gts_for_pred[pid]
-            n = len(matched_gids)
-            if n == 0:
-                ic_p[idx_p] = 0.0
-                continue
-
-            weights = []
-            p_area = max(p_area_sums[idx_p], 1e-15)
-            for gid in matched_gids:
-                idx_g = g_map[gid]
-                w = min(1.0, g_area_sums[idx_g] / p_area) ** strict_alpha
-                weights.append(w)
-
-            ic_p[idx_p] = float(np.sum(weights)) / (n ** 2)
-    else:
-        for pid, idx_p in p_map.items():
-            n = len(matched_gts_for_pred[pid])
-            ic_p[idx_p] = (1.0 / n) if n > 0 else 0.0
+    for pid, idx_p in p_map.items():
+        n = len(matched_gts_for_pred[pid])
+        ic_p[idx_p] = (1.0 / n) if n > 0 else 0.0
 
     # GT-axis identity concentration.
     ic_g = np.zeros(num_g, dtype=np.float64)
@@ -241,46 +197,7 @@ def _compute_identity_concentration(
             ic_g[idx_g] = 0.0
             continue
 
-        base_ic_g = 1.0 / n
-
-        if not use_redundancy_factor:
-            ic_g[idx_g] = base_ic_g
-            continue
-
-        # Optional concurrent-overlap redundancy factor
-        # union(active matched preds) / sum(active matched pred areas)
-        redundancy_factors = []
-
-        for t in range(len(seg_list)):
-            g_masks_t = frame_g_masks[t]
-            p_masks_t = frame_p_masks[t]
-            p_areas_t = frame_p_areas[t]
-
-            if gid not in g_masks_t:
-                continue
-
-            active_pids = [pid for pid in matched_pids if pid in p_masks_t]
-
-            if len(active_pids) <= 1:
-                redundancy_factors.append(1.0)
-                continue
-
-            sum_area = sum(p_areas_t[pid] for pid in active_pids)
-            if sum_area <= 0:
-                redundancy_factors.append(1.0)
-                continue
-
-            ref_shape = g_masks_t[gid].shape
-            union_mask = np.zeros(ref_shape, dtype=bool)
-            for pid in active_pids:
-                union_mask |= p_masks_t[pid]
-
-            union_area = int(union_mask.sum())
-            eff = union_area / max(sum_area, 1)
-            redundancy_factors.append(float(eff))
-
-        redundancy_factor = float(np.mean(redundancy_factors)) if redundancy_factors else 1.0
-        ic_g[idx_g] = base_ic_g * redundancy_factor
+        ic_g[idx_g] = 1.0 / n
 
     return ic_p, ic_g
 
@@ -1011,13 +928,10 @@ def evaluate_vos_consistency(seg_list,
         iou_thr=iou_thr,
         ios_thr=ios_thr,
         use_void_tolerant=True,
-        use_redundancy_factor=False,
-        strict_alpha=1.0,
-        weighted_ic_p=False,
     )
 
-    ic_p_avg = float(np.mean(ic_p_arr)) * avg_discovery_tax
-    ic_g_avg = float(np.mean(ic_g_arr)) * avg_discovery_tax
+    ic_p_avg = float(np.mean(ic_p_arr)) if len(ic_p_arr) > 0 else 0.0
+    ic_g_avg = float(np.mean(ic_g_arr)) if len(ic_g_arr) > 0 else 0.0
 
     # Temporal stability.
     c_ts, c_clus, c_curve, ts_raw, clus_raw, curve_raw = \
@@ -1066,8 +980,8 @@ def evaluate_vos_consistency(seg_list,
         ip_p = np.mean(p_scores_global[m_p]) if any(m_p) else 0.0
         ip_g = np.mean(g_scores_global[m_g]) if any(m_g) else 0.0
         
-        ic_p = np.mean(ic_p_arr[m_p]) * avg_discovery_tax if any(m_p) else 0.0
-        ic_g = np.mean(ic_g_arr[m_g]) * avg_discovery_tax if any(m_g) else 0.0
+        ic_p = np.mean(ic_p_arr[m_p]) if any(m_p) else 0.0
+        ic_g = np.mean(ic_g_arr[m_g]) if any(m_g) else 0.0
         
         ip_spat = np.mean(p_scores_spatial[m_p]) if any(m_p) else 0.0
         t_bleed = np.mean(temporal_bleeds[m_p]) if any(m_p) else 0.0

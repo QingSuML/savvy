@@ -1,18 +1,14 @@
 import csv
 import json
 import os
+import shutil
+import time
 from collections import defaultdict
 
 import numpy as np
 
 from .datasets import HM3DVOSDataset, ScannetVOSDataset
 from .metrics import compute_sequence_stq_vpq, evaluate_vos_consistency
-from .stress import (
-    apply_dynamic_spatial_dilation,
-    apply_macro_sever,
-    apply_sparse_id_flickering,
-    apply_temporal_dropout,
-)
 
 
 class VOSEvaluator:
@@ -30,6 +26,7 @@ class VOSEvaluator:
         self.cooccur_sim_thr= cooccur_sim_thr
         self.max_pattern_size = max_pattern_size
         self.results_per_scene = {}
+        self._result_backup_paths = set()
                 
     def evaluate(self, scene_names=None):
         
@@ -67,6 +64,8 @@ class VOSEvaluator:
             self.results_per_scene[sid] = res
 
     def evaluate_macro_sever_test(self, scene_names=None):
+        from .stress import apply_macro_sever
+
         num_severs = [1, 2, 3, 4]
 
         if isinstance(scene_names, str):
@@ -108,6 +107,8 @@ class VOSEvaluator:
                 self.results_per_scene[sid + f'_macro_sever_{num}'] = res
     
     def evaluate_drop_test(self, scene_names=None):
+        from .stress import apply_temporal_dropout
+
         drop_prob = [0.05, 0.1, 0.15, 0.2]
 
         if isinstance(scene_names, str):
@@ -148,6 +149,8 @@ class VOSEvaluator:
                 self.results_per_scene[sid + f'_dropout_{prob}'] = res
 
     def evaluate_clutter_test(self, scene_names=None, mode="overwrite"):
+        from .stress import apply_dynamic_spatial_dilation
+
         severity_levels = [1, 2, 4, 8]
 
         if isinstance(scene_names, str):
@@ -193,6 +196,8 @@ class VOSEvaluator:
                 self.results_per_scene[sid + f'_clutter_{mode}_{severity}'] = res
 
     def evaluate_dilation_test(self, scene_names=None):
+        from .stress import apply_dynamic_spatial_dilation
+
         severity_levels = [1, 2, 4, 8]
 
         if isinstance(scene_names, str):
@@ -236,6 +241,8 @@ class VOSEvaluator:
                 self.results_per_scene[sid + f'_dilation_void_{severity}'] = res
 
     def evaluate_flickering_test(self, scene_names=None):
+        from .stress import apply_sparse_id_flickering
+
         fraction_level = [0.025, 0.05, 0.075, 0.1]
 
         if isinstance(scene_names, str):
@@ -281,20 +288,31 @@ class VOSEvaluator:
         os.makedirs(output_dir, exist_ok=True)
         filename = f"oga_full_results_{tag}" if tag is not None else "oga_full_results"
 
+        def backup_once(path):
+            if path in self._result_backup_paths or not os.path.exists(path):
+                return
+            timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+            backup_path = f"{path}.bak_{timestamp}"
+            shutil.copy(path, backup_path)
+            self._result_backup_paths.add(path)
+            print(f"[backup] Preserved existing results: {backup_path}")
+
         # Save full nested JSON.
         json_path = os.path.join(output_dir, filename + ".json")
+        backup_once(json_path)
         with open(json_path, 'w') as f:
             json.dump(self.results_per_scene, f, indent=4)
             
         # Save flattened macro CSV.
         csv_path = os.path.join(output_dir, filename + ".csv")
+        backup_once(csv_path)
         with open(csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
             
             header = [
                 "Scene ID", "STQ", "AQ", "GQ", 
                 "VPQ_0", "VPQ_5", "VPQ_15", "VPQ_25", "VPQ_35", "VPQ_inf",
-                "IP (C)", "IP (P)", "IP (G)", "IC (P)", "IC (G)", "Spat.IP", "T.Bleed",
+                "IP (C)", "IP (P)", "IP (G)", "IC (P)", "IC (G)", "Discovery", "Spat.IP", "T.Bleed",
                 "TS (C)", "Cluster", "Patt k=1", "Patt k=2", "Patt k=3"
             ]
             writer.writerow(header)
@@ -315,7 +333,7 @@ class VOSEvaluator:
                     f"{base.get('VPQ_0', 0):.4f}", f"{base.get('VPQ_5', 0):.4f}", f"{base.get('VPQ_15', 0):.4f}",
                     f"{base.get('VPQ_25', 0):.4f}", f"{base.get('VPQ_35', 0):.4f}", f"{base.get('VPQ_inf', 0):.4f}",
                     f"{ip.get('combined', 0):.4f}", f"{ip.get('prediction_axis', 0):.4f}", f"{ip.get('gt_axis', 0):.4f}",
-                    f"{ip.get('ic_p', 0):.4f}", f"{ip.get('ic_g', 0):.4f}",
+                    f"{ip.get('ic_p', 0):.4f}", f"{ip.get('ic_g', 0):.4f}", f"{ip.get('discovery_tax', 0):.4f}",
                     f"{ip.get('pred_spatial', 0):.4f}", f"{ip.get('temporal_bleed', 0):.4f}",
                     f"{ts.get('combined', 0):.4f}", f"{ts.get('cluster', 0):.4f}",
                     f"{patt_1:.4f}", 
@@ -330,7 +348,7 @@ class VOSEvaluator:
         if not self.results_per_scene: return print("No results.")
         
         # Keep the table wide enough for all OGA and baseline columns.
-        h = "-" * 235 
+        h = "-" * 247
         print(
             h + 
             f"\n{'Scene ID':<16} | "
@@ -348,6 +366,7 @@ class VOSEvaluator:
             f"{'IP (G)':<7} | "
             f"{'IC (P)':<7} | "
             f"{'IC (G)':<7} | "
+            f"{'Disc.':<7} | "
             f"{'Spat.IP':<7} | "
             f"{'T.Bleed':<7} | "
             f"{'TS (C)':<7} | "
@@ -380,6 +399,7 @@ class VOSEvaluator:
                   f"{ip['gt_axis']:<7.4f} | "
                   f"{ip.get('ic_p', 0):<7.4f} | "
                   f"{ip.get('ic_g', 0):<7.4f} | "
+                  f"{ip.get('discovery_tax', 0):<7.4f} | "
                   f"{ip['pred_spatial']:<7.4f} | "
                   f"{ip['temporal_bleed']:<7.4f} | "
                   f"{ts['combined']:<7.4f} | "
@@ -413,6 +433,7 @@ class VOSEvaluator:
                 f"{d.get('ip_g',0):<7.4f} | "
                 f"{d.get('ic_p',0):<7.4f} | "
                 f"{d.get('ic_g',0):<7.4f} | "
+                f"{'N/A':<7} | "
                 f"{d.get('ip_spat',0):<7.4f} | "
                 f"{d.get('t_bleed',0):<7.4f} | "
                 f"{d.get('ts_c',0):<7.4f} | "
