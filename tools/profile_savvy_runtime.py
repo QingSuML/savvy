@@ -108,6 +108,7 @@ def run_savvy_behavior_runner(args: argparse.Namespace, all_scenes_csv: Path) ->
         sys.executable,
         str(EVAL_ROOT / "tools" / "savvy_behavior_runner.py"),
         "--gt_dir", str(args.gt_dir),
+        "--gt_subdir", str(args.gt_subdir),
         "--video_dir", str(args.video_dir),
         "--sam1_ckpt", str(args.sam1_ckpt),
         "--sam2_ckpt", str(args.sam2_ckpt),
@@ -497,6 +498,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--metrics_csv", type=Path, default=DEFAULT_METRICS_CSV)
     parser.add_argument("--gt_dir", type=Path, default=DEFAULT_GT_DIR)
+    parser.add_argument("--gt_subdir", default="instance")
     parser.add_argument("--video_dir", type=Path, default=DEFAULT_VIDEO_DIR)
     parser.add_argument("--sam1_ckpt", type=Path, default=DEFAULT_SAM1_CKPT)
     parser.add_argument("--sam2_ckpt", type=Path, default=DEFAULT_SAM2_CKPT)

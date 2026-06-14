@@ -66,6 +66,20 @@ Click any thumbnail to watch the demo on YouTube.
 | --- | --- | --- | --- | --- |
 | [![HM3D demo video 1](https://img.youtube.com/vi/XU4bD5u9jHY/hqdefault.jpg)](https://youtu.be/XU4bD5u9jHY) | [![HM3D demo video 2](https://img.youtube.com/vi/jOk4z26IqAs/hqdefault.jpg)](https://youtu.be/jOk4z26IqAs) | [![HM3D demo video 3](https://img.youtube.com/vi/x90Cdeh0UcE/hqdefault.jpg)](https://youtu.be/x90Cdeh0UcE) | [![HM3D demo video 4](https://img.youtube.com/vi/FLKxZwibS7Y/hqdefault.jpg)](https://youtu.be/FLKxZwibS7Y) | [![HM3D demo video 5](https://img.youtube.com/vi/jOk4z26IqAs/hqdefault.jpg)](https://youtu.be/jOk4z26IqAs) |
 
+## HM3D Trajectory Collection
+
+In addition to ScanNet evaluation, Savvy is evaluated on a 106-scene HM3D
+trajectory collection generated with Habitat-Sim. The trajectories are designed
+to stress long-horizon open-world video segmentation: the camera moves through
+indoor environments, observes new objects over time, and revisits previously
+seen regions after large viewpoint changes.
+
+The HM3D videos, RGB renders, instance annotations, and trajectory metadata are
+used by the HM3D evaluation runner in this repository. The trajectory generation
+and rendering pipeline is maintained as a separate Habitat-based project during
+development, and we plan to release it with the generated trajectory collection
+to support reproducible HM3D evaluation.
+
 ## Qualitative Visualizations
 
 ### ScanNet

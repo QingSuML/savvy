@@ -183,7 +183,10 @@ class Savvy:
     def _count_segmenter_candidates(self, external_masks):
         if external_masks is None:
             return 0
-        arr = np.asarray(external_masks)
+        if torch.is_tensor(external_masks):
+            arr = external_masks.detach().cpu().numpy()
+        else:
+            arr = np.asarray(external_masks)
         if arr.ndim == 3:
             return int(arr.shape[0])
         labels = np.unique(arr)

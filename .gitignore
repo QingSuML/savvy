@@ -17,6 +17,7 @@ eval_predictions/
 runtime_logs/
 savvy_behavior_logs/
 behavior_logs/
+verification_runs/
 visualizations/
 !assets/visualizations/
 !assets/visualizations/**

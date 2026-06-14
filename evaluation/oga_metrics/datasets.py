@@ -5,19 +5,23 @@ import numpy as np
 
 
 class ScannetVOSDataset:
-    def __init__(self, gt_dir, pred_dir, pred_scene_map=None):
+    def __init__(self, gt_dir, pred_dir, pred_scene_map=None, gt_subdir="instance"):
         self.gt_dir = gt_dir
         self.pred_dir = pred_dir
         self.pred_scene_map = pred_scene_map or {}
+        self.gt_subdir = gt_subdir
         
     def get_scene_ids(self):
-        return sorted([d for d in os.listdir(self.gt_dir) 
-                       if os.path.isdir(os.path.join(self.gt_dir, d))])
+        return sorted([
+            d for d in os.listdir(self.gt_dir)
+            if os.path.isdir(os.path.join(self.gt_dir, d))
+            and os.path.isdir(os.path.join(self.gt_dir, d, self.gt_subdir))
+        ])
         
     def load_scene_frames(self, scene_id):
         from PIL import Image
 
-        gt_path = os.path.join(self.gt_dir, scene_id, "instance")
+        gt_path = os.path.join(self.gt_dir, scene_id, self.gt_subdir)
         pred_scene_dir = self.pred_scene_map.get(scene_id, scene_id)
         pr_path = os.path.join(self.pred_dir, pred_scene_dir)
         

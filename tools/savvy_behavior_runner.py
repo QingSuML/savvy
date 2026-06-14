@@ -50,7 +50,7 @@ def process_single_scene(args, scene_id, gt_base_dir, video_base_dir, out_eval_d
                         ):
     """Runs the Savvy pipeline on a single scene and saves the raw masks."""
     video_dir = os.path.join(video_base_dir, scene_id)
-    gt_scene_dir = os.path.join(gt_base_dir, scene_id, "instance")
+    gt_scene_dir = os.path.join(gt_base_dir, scene_id, args.gt_subdir)
 
     if not os.path.exists(video_dir) or not os.path.exists(gt_scene_dir):
         print(f"Skipping {scene_id}: Missing video or GT data.")
@@ -165,7 +165,11 @@ def main(args):
     os.makedirs(behavior_log_root, exist_ok=True)
 
     # --- 2. History & Folder Mapping ---
-    dataset = ScannetVOSDataset(gt_dir=args.gt_dir, pred_dir=eval_root)
+    dataset = ScannetVOSDataset(
+        gt_dir=args.gt_dir,
+        pred_dir=eval_root,
+        gt_subdir=args.gt_subdir,
+    )
     evaluator = VOSEvaluator(dataset, max_pattern_size=3)
     filename = "oga_full_results.json" if args.exp_tag is None else f"oga_full_results_{args.exp_tag}.json"
     history_file = os.path.join(eval_root, filename)
@@ -300,6 +304,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--gt_dir", type=str, default="/path/to/scannet/gt")
+    parser.add_argument("--gt_subdir", type=str, default="instance")
     parser.add_argument("--video_dir", type=str, default="/path/to/scannet/scannet_val")
     parser.add_argument("--eval_dir", type=str, default="./eval_predictions")
     parser.add_argument("--vis_dir", type=str, default="./eval_visualizations")
