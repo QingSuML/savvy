@@ -2,6 +2,9 @@
 """
 Run Savvy behavior/runtime profiling over ScanNet videos and plot the logs.
 
+This script profiles the Savvy mask-management portion of the pipeline. It does
+not include the SAM2 mask propagation cost in the reported runtime.
+
 Example:
     python tools/profile_savvy_runtime.py \
         --device cuda:0 \
